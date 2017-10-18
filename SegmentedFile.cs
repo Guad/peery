@@ -10,87 +10,62 @@ namespace Peery
     {
         private Stream _stream;
 
-        private Dictionary<long, FileSegment> _segments;
+        private const int PacketLength = 1024;
+        private const bool AlwaysFlush = false;
 
-        private const int MaxPendingSegments = 10;
-        private const int PacketLength = 512;
-        private const bool AlwaysFlush = true;
+        public static long BufferFlushInterval;
 
-        public long AcknowledgedBytes;
         public long BytesToTransfer;
         public long BytesTransferred;
         public long Length;
-        public long Position;
+        public long LastBufferFlush;
 
-        public int PendingSegments => _segments.Count;
+        public long Position
+        {
+            get { return _stream.Position; }
+            set { _stream.Position = value; }
+        }
 
         public SegmentedFile(Stream stream)
         {
             _stream = stream;
-            _segments = new Dictionary<long, FileSegment>();
-
             Length = stream.Length;
-            Position = stream.Position;
             BytesToTransfer = Length - Position;
         }
 
-        public async Task<FileSegment> SendSegmentAsync()
+        public async Task<byte[]> SendSegmentAsync()
         {
-            if (_segments.Count > MaxPendingSegments || Position == Length)
+            if (Position >= Length)
             {
-                // Too many unacknowledged segments
-                // Or we're done sending
-                // Send oldest first
-                if (_segments.Count > 0)
-                {
-                    // Slow down, client may not be able to catch up
-                    await Task.Delay(100);
-
-                    return _segments.First().Value;
-                }
+                // we're done sending
                 return null;
             }
             else
             {
                 int len = (int) Math.Min(PacketLength, Length - Position);
 
-                // Send new segment
-                FileSegment segment = new FileSegment();
-                segment.Length = len;
-                segment.Position = Position;
-                segment.Data = new byte[len];
+                byte[] data = new byte[len];
 
-                await _stream.ReadAsync(segment.Data, 0, len);
+                await _stream.ReadAsync(data, 0, len);
 
-                _segments.Add(Position, segment);
-
-                Position += len;
                 BytesTransferred += len;
                 
-                return segment;
+                return data;
             }
         }
 
-        public async Task ReceiveSegmentAsync(FileSegment segment)
+        public async Task ReceiveSegmentAsync(byte[] segment)
         {
-            _stream.Position = segment.Position;
-            await _stream.WriteAsync(segment.Data, 0, segment.Length);
+            await _stream.WriteAsync(segment, 0, segment.Length);
             BytesTransferred += segment.Length;
-            if (segment.Position > Position)
-                Position = segment.Position;
 
-            if (AlwaysFlush)
+            if (Position - LastBufferFlush > BufferFlushInterval)
+            {
                 await _stream.FlushAsync();
+                LastBufferFlush = Position;
+            }
         }
-
-        public void Acknowledge(long pos)
-        {
-            if (_segments.ContainsKey(pos))
-                AcknowledgedBytes += _segments[pos].Length;
-
-            _segments.Remove(pos);
-        }
-
+        
         public void Dispose()
         {
             _stream?.Flush();

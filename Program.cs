@@ -5,14 +5,16 @@ using CommandLine;
 
 namespace Peery
 {
-    class Program
+    public class Program
     {
-        static async Task Main(string[] args)
+        public static async Task Main(string[] args)
         {
             CommandlineArguments arguments = null;
             var result = Parser.Default.ParseArguments<CommandlineArguments>(args);
             if (!result.MapResult(p => { arguments = p; return true; }, p => false))
                 return;
+
+            SegmentedFile.BufferFlushInterval = arguments.BufferSize;
 
             IFileExchange exchange;
 
@@ -30,10 +32,12 @@ namespace Peery
                 exchange = new FileSender(IPAddress.Parse(arguments.Host), arguments.Port, arguments.File, code);
             }
 
+
             exchange.Verbose = arguments.Verbose;
 
             Console.Write("Connecting...");
 
+            AppDomain.CurrentDomain.UnhandledException += (sender, eventArgs) => exchange.Stop();
             Console.CancelKeyPress += (sender, eventArgs) => exchange.Stop();
 
             await exchange.Start();
@@ -44,8 +48,8 @@ namespace Peery
 
             while (!exchange.Finished)
             {
-                await exchange.Pulse();
                 if (!arguments.Verbose) bar.Update(exchange.File);
+                await exchange.Pulse();
             }
 
             if (!arguments.Verbose) bar.End();

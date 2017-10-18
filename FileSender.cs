@@ -10,7 +10,8 @@ namespace Peery
     {
         private IPAddress _address;
         private int _port;
-        private UdpClient _socket;
+        private TcpClient _socket;
+        private NetworkStream _stream;
         private SegmentedFile _file;
         private string _path;
         private int _code;
@@ -24,20 +25,27 @@ namespace Peery
         }
 
         public bool Finished { get; private set; }
+        private bool _gracefully;
         public bool Verbose { get; set; }
         public SegmentedFile File => _file;
 
 
         public async Task Start()
         {
-            _socket = new UdpClient();
-            _socket.AllowNatTraversal(true);
+            _socket = new TcpClient();
 
             VerboseLog("Starting connection to " + _address + ":" + _port);
 
             _socket.Connect(new IPEndPoint(_address, _port));
+            _stream = _socket.GetStream();
 
             _file = new SegmentedFile(System.IO.File.OpenRead(_path));
+
+            long pos;
+            if (TryLoadState(out pos))
+            {
+                _file.Position = pos;
+            }
 
             byte[] fileInfo = new byte[1 + 4 + 8 + 8];
 
@@ -50,61 +58,77 @@ namespace Peery
             Array.Copy(BitConverter.GetBytes(_file.Position), 0, fileInfo, 13, 8);
 
             VerboseLog("Sending welcome packet: " + string.Join(", ", fileInfo));
-            await _socket.SendAsync(fileInfo, fileInfo.Length);
+            await _stream.WriteAsync(fileInfo, 0, fileInfo.Length);
         }
 
         public async Task Pulse()
         {
-            // Assume we're connected
-            if (_socket.Available > 0)
+            byte[] segment = await _file.SendSegmentAsync();
+
+            if (segment != null)
             {
+                VerboseLog("Sending packet of length " + segment.Length);
                 try
                 {
-                    UdpReceiveResult result = await _socket.ReceiveAsync();
-                    await HandlePacket(result);
+                    await _stream.WriteAsync(segment, 0, segment.Length);
                 }
-                catch (SocketException)
+                catch (IOException)
                 {
-                    Console.WriteLine("Connection closed by remote peer");
+                    Console.WriteLine("\nConnection closed by remote peer");
                     Finished = true;
                     return;
                 }
             }
 
-            FileSegment segment = await _file.SendSegmentAsync();
-
-            if (segment != null)
+            if (_file.Position >= _file.Length)
             {
-                byte[] payload = segment.BinarySerialize();
-                await _socket.SendAsync(payload, payload.Length);
-            }
-
-            if (_file.Position >= _file.Length && _file.PendingSegments == 0)
+                _gracefully = true;
                 Finished = true;
+            }
         }
 
         public void Stop()
         {
             VerboseLog("Finished");
 
+            if (!_gracefully)
+                SaveState();
+            else if (System.IO.File.Exists(_path + ".peery"))
+                System.IO.File.Delete(_path + ".peery");
+
             _file?.Dispose();
             _socket?.Close();
             _socket?.Dispose();
         }
 
-        private async Task HandlePacket(UdpReceiveResult result)
+        private void SaveState()
         {
-            if (!Equals(result.RemoteEndPoint.Address, _address))
-                return;
+            string path = _path + ".peery";
 
-            if (result.Buffer[0] == (int) PacketType.Ack && result.Buffer.Length == 9)
-            {
-                long pos = BitConverter.ToInt64(result.Buffer, 1);
-                VerboseLog("Received ACK for " + pos);
-                _file.Acknowledge(pos);
-            }
+            if (System.IO.File.Exists(path))
+                System.IO.File.Delete(path);
+
+            System.IO.File.WriteAllBytes(path, BitConverter.GetBytes(_file.Position));
         }
 
+        private bool TryLoadState(out long pos)
+        {
+            string path = _path + ".peery";
+
+            if (System.IO.File.Exists(path))
+            {
+                pos = BitConverter.ToInt64(System.IO.File.ReadAllBytes(path), 0);
+
+                System.IO.File.Delete(path);
+
+                return true;
+            }
+
+            pos = 0;
+
+            return false;
+        }
+        
         private void VerboseLog(string text)
         {
             if (Verbose) Console.WriteLine(text);

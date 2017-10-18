@@ -9,9 +9,10 @@ namespace Peery
     public class FileReceiver : IFileExchange
     {
         private int _port;
-        private UdpClient _socket;
+        private TcpListener _socket;
+        private TcpClient _client;
+        private NetworkStream _clientStream;
         private int _password;
-        private IPAddress _client;
         private SegmentedFile _file;
         private string _path;
 
@@ -30,9 +31,9 @@ namespace Peery
 
         public async Task Start()
         {
-            _socket = new UdpClient(new IPEndPoint(IPAddress.Any, _port));
+            _socket = new TcpListener(new IPEndPoint(IPAddress.Any, _port));
             _socket.AllowNatTraversal(true);
-
+            _socket.Start();
             VerboseLog("Awaiting connections");
         }
 
@@ -40,14 +41,17 @@ namespace Peery
         {
             try
             {
-                UdpReceiveResult result = await _socket.ReceiveAsync();
-                await HandlePacket(result);
+                if (_socket.Pending())
+                    await AcceptClient();
 
-                VerboseLog($"Ack: {_file.AcknowledgedBytes}, Len: {_file.Length} Total: {_file.BytesToTransfer} Transferred: {_file.BytesTransferred}");
+                if (_client != null && _client.Available > 0)
+                {
+                    await HandlePacket();
+                }
             }
             catch (SocketException)
             {
-                Console.WriteLine("Connection closed by remote peer");
+                Console.WriteLine("\nConnection closed by remote peer");
                 Finished = true;
             }
         }
@@ -57,62 +61,87 @@ namespace Peery
             VerboseLog("Finished");
 
             _file?.Dispose();
-            _socket?.Close();
-            _socket?.Dispose();
+            _client?.Close();
+            _client?.Dispose();
+            _socket?.Stop();
         }
 
-        private async Task HandlePacket(UdpReceiveResult result)
+        private async Task AcceptClient()
         {
-            if (_client == null && (PacketType)result.Buffer[0] == PacketType.SetFileInfo)
-            {
-                int pinCode = BitConverter.ToInt32(result.Buffer, 1);
-                long length = BitConverter.ToInt64(result.Buffer, 5);
-                long position = BitConverter.ToInt64(result.Buffer, 13);
+            TcpClient cl = await _socket.AcceptTcpClientAsync();
 
-                VerboseLog("New connection from " + result.RemoteEndPoint.Address + ":" + result.RemoteEndPoint.Port);
+            if (_client != null && IsClientConnected())
+            {
+                cl.Close();
+                return;
+            }
+
+            byte[] buffer = new byte[1 + 4 + 8 + 8];
+
+            await cl.GetStream().ReadAsync(buffer, 0, buffer.Length);
+
+            if (buffer[0] == (byte) PacketType.SetFileInfo)
+            {
+                int pinCode = BitConverter.ToInt32(buffer, 1);
+                long length = BitConverter.ToInt64(buffer, 5);
+                long position = BitConverter.ToInt64(buffer, 13);
+
+                VerboseLog("New connection from " + cl.Client.RemoteEndPoint);
                 VerboseLog($"File len: {length} with starting pos {position}");
-                VerboseLog("Payload: " + string.Join(",", result.Buffer));
+                VerboseLog("Payload: " + string.Join(",", buffer));
 
                 if (pinCode == _password)
                 {
-                    _client = result.RemoteEndPoint.Address;
+                    _client = cl;
+                    _clientStream = cl.GetStream();
 
-                    _file = new SegmentedFile(System.IO.File.OpenWrite(_path));
+                    if (_file == null)
+                        _file = new SegmentedFile(System.IO.File.OpenWrite(_path));
                     _file.Position = position;
                     _file.Length = length;
-                    _file.BytesToTransfer = _file.Length - _file.Position;
-
-                    _socket.Connect(result.RemoteEndPoint);
+                    _file.BytesTransferred = 0;
+                    _file.BytesToTransfer = _file.Length - position;
 
                     VerboseLog("Connection successful!");
                 }
             }
-            else if (Equals(_client, result.RemoteEndPoint.Address))
-            {
-                // Assume it's file data
-                FileSegment segment = FileSegment.BinaryDeserialize(result.Buffer);
+        }
 
-                if (segment != null)
-                {
-                    VerboseLog("Receiving segment " + segment.Position + " with len " + segment.Length);
+        private async Task HandlePacket()
+        {
+            VerboseLog("Available to read: " + _client.Available);
 
-                    await _file.ReceiveSegmentAsync(segment);
-                    // Acknowledge
-                    byte[] ackPacket = new byte[9];
-                    ackPacket[0] = (byte) PacketType.Ack;
-                    Array.Copy(BitConverter.GetBytes(segment.Position), 0, ackPacket, 1, 8);
+            byte[] buffer = new byte[_client.Available];
 
-                    await _socket.SendAsync(ackPacket, ackPacket.Length);
-                    
-                    if (_file.BytesToTransfer - _file.BytesTransferred == 0)
-                        Finished = true;
-                }
-            }
+            await _clientStream.ReadAsync(buffer, 0, buffer.Length);
+
+            VerboseLog("Receiving segment with len " + buffer.Length);
+
+            await _file.ReceiveSegmentAsync(buffer);
+
+            if (_file.BytesToTransfer - _file.BytesTransferred == 0)
+                Finished = true;
         }
 
         private void VerboseLog(string text)
         {
             if (Verbose) Console.WriteLine(text);
+        }
+
+        private bool IsClientConnected()
+        {
+            if (_client == null) return false;
+            if (!_client.Connected) return false;
+
+            if (_client.Client.Poll(0, SelectMode.SelectWrite) && !_client.Client.Poll(0, SelectMode.SelectError))
+            {
+                byte[] buf = new byte[1];
+                if (_client.Client.Receive(buf, SocketFlags.Peek) == 0)
+                    return false;
+                return true;
+            }
+
+            return false;
         }
     }
 }
