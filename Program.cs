@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Net;
 using System.Threading.Tasks;
-using CommandLine;
 
 namespace Peery
 {
@@ -9,10 +8,19 @@ namespace Peery
     {
         public static async Task Main(string[] args)
         {
-            CommandlineArguments arguments = null;
-            var result = Parser.Default.ParseArguments<CommandlineArguments>(args);
-            if (!result.MapResult(p => { arguments = p; return true; }, p => false))
+            CommandlineArguments arguments = Parser.Parse<CommandlineArguments>(args);
+
+            if (arguments.Help)
+            {
+                Console.WriteLine(Parser.GenerateHelpText<CommandlineArguments>());
                 return;
+            }
+
+            if (string.IsNullOrEmpty(arguments.File))
+            {
+                Console.WriteLine("Missing parameter: File");
+                return;
+            }
 
             SegmentedFile.BufferFlushInterval = arguments.BufferSize;
 
