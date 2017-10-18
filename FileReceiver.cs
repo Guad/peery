@@ -32,7 +32,7 @@ namespace Peery
         public async Task Start()
         {
             _socket = new TcpListener(new IPEndPoint(IPAddress.Any, _port));
-            _socket.AllowNatTraversal(true);
+            //_socket.AllowNatTraversal(true);
             _socket.Start();
             VerboseLog("Awaiting connections");
         }
